@@ -1,0 +1,75 @@
+From 80ee540e1c34efc21a3e8f2cee06509a9689456b Mon Sep 17 00:00:00 2001
+From: Albin Hedman <albin9604@gmail.com>
+Date: Mon, 27 Jan 2020 13:11:36 +0100
+Subject: [PATCH] Fixed code example in doc
+
+---
+ examples/simple.rs |  2 +-
+ src/lib.rs         | 35 +++++++++++++----------------------
+ 2 files changed, 14 insertions(+), 23 deletions(-)
+
+diff --git a/examples/simple.rs b/examples/simple.rs
+index dbb744f..52a2f6c 100644
+--- a/examples/simple.rs
++++ b/examples/simple.rs
+@@ -5,7 +5,7 @@ extern crate tokio_ping;
+ 
+ use crate::futures::{StreamExt, future};
+ 
+-#[tokio::main(basic_scheduler)]
++#[tokio::main]
+ async fn main() {
+     let addr = std::env::args().nth(1).unwrap().parse().unwrap();
+ 
+diff --git a/src/lib.rs b/src/lib.rs
+index d093312..da3bdff 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -7,31 +7,22 @@
+ //! Note, sending and receiving ICMP packets requires privileges.
+ //!
+ //! ```rust,no_run
+-//! extern crate futures;
+-//! extern crate tokio;
++//! use futures::{future, StreamExt};
+ //!
+-//! extern crate tokio_ping;
+-//!
+-//! use futures::{Future, Stream};
+-//!
+-//! fn main() {
++//! #[tokio::main]
++//! async fn main() {
+ //!     let addr = std::env::args().nth(1).unwrap().parse().unwrap();
+ //!
+-//!     let pinger = tokio_ping::Pinger::new();
+-//!     let stream = pinger.and_then(move |pinger| Ok(pinger.chain(addr).stream()));
+-//!     let future = stream.and_then(|stream| {
+-//!         stream.take(3).for_each(|mb_time| {
+-//!             match mb_time {
+-//!                 Some(time) => println!("time={:?}", time),
+-//!                 None => println!("timeout"),
+-//!             }
+-//!             Ok(())
+-//!         })
+-//!     });
+-//!
+-//!     tokio::run(future.map_err(|err| {
+-//!         eprintln!("Error: {}", err)
+-//!     }))
++//!     let pinger = tokio_ping::Pinger::new().await.unwrap();
++//!     let stream = pinger.chain(addr).stream();
++//!     stream.take(3).for_each(|mb_time| {
++//!         match mb_time {
++//!             Ok(Some(time)) => println!("time={:?}", time),
++//!             Ok(None) => println!("timeout"),
++//!             Err(err) => println!("error: {:?}", err)
++//!         }
++//!         future::ready(())
++//!     }).await;
+ //! }
+ //! ```
+ 
+-- 
+2.24.1.windows.2
+

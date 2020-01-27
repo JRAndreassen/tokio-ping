@@ -1,0 +1,26 @@
+From f1827cec82490537137d6e46b8e2fa8cfd72bb35 Mon Sep 17 00:00:00 2001
+From: Albin Hedman <albin9604@gmail.com>
+Date: Wed, 27 Nov 2019 17:57:01 +0100
+Subject: [PATCH] Updated for tokio 0.2
+
+---
+ Cargo.toml | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index dd6aa37..3a714ca 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -17,8 +17,7 @@ libc = "0.2"
+ mio = "0.6"
+ rand = "0.4"
+ socket2 = "0.3"
+-tokio = "0.2.0-alpha.6"
++tokio = { version = "0.2.1", features = ["rt-core"] }
+ tokio-net = "0.2.0-alpha.6"
+-tokio-executor="0.1.2"
+ tokio-timer = "0.3.0-alpha.5"
+ parking_lot = "0.5.5"
+-- 
+2.24.1.windows.2
+

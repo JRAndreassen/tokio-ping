@@ -1,0 +1,183 @@
+From 7f6b589d88574a68ee935013cd841795440efb46 Mon Sep 17 00:00:00 2001
+From: Albin Hedman <albin9604@gmail.com>
+Date: Fri, 13 Dec 2019 19:34:59 +0100
+Subject: [PATCH] Fixed 'no current reactor'-bug
+
+---
+ Cargo.toml          |  7 ++++---
+ examples/simple.rs  |  4 ++--
+ src/lib.rs          |  1 -
+ src/ping.rs         | 27 ++++++++++-----------------
+ src/socket/tokio.rs |  8 +++-----
+ 5 files changed, 19 insertions(+), 28 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 3a714ca..92c57fc 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -17,7 +17,8 @@ libc = "0.2"
+ mio = "0.6"
+ rand = "0.4"
+ socket2 = "0.3"
+-tokio = { version = "0.2.1", features = ["rt-core"] }
+-tokio-net = "0.2.0-alpha.6"
+-tokio-timer = "0.3.0-alpha.5"
++tokio = { version = "0.2.4", features = ["rt-core", "io-driver", "time"] }
+ parking_lot = "0.5.5"
++
++[dev-dependencies]
++tokio = { version = "0.2.4", features = ["rt-core", "io-driver", "time", "macros"] }
+diff --git a/examples/simple.rs b/examples/simple.rs
+index 219be58..dbb744f 100644
+--- a/examples/simple.rs
++++ b/examples/simple.rs
+@@ -5,7 +5,7 @@ extern crate tokio_ping;
+ 
+ use crate::futures::{StreamExt, future};
+ 
+-#[tokio::main]
++#[tokio::main(basic_scheduler)]
+ async fn main() {
+     let addr = std::env::args().nth(1).unwrap().parse().unwrap();
+ 
+@@ -15,7 +15,7 @@ async fn main() {
+         match mb_time {
+             Ok(Some(time)) => println!("time={:?}", time),
+             Ok(None) => println!("timeout"),
+-            Err(err) => println!("{:?}", err)
++            Err(err) => println!("error: {:?}", err)
+         }
+         future::ready(())
+     }).await;
+diff --git a/src/lib.rs b/src/lib.rs
+index 4bbc818..d093312 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -36,7 +36,6 @@
+ //! ```
+ 
+ #[macro_use] extern crate failure;
+-#[macro_use] extern crate futures;
+ 
+ mod errors;
+ mod packet;
+diff --git a/src/ping.rs b/src/ping.rs
+index 88d419d..787a623 100644
+--- a/src/ping.rs
++++ b/src/ping.rs
+@@ -14,10 +14,7 @@ use rand::random;
+ use parking_lot::Mutex;
+ use socket2::{Domain, Protocol, Type};
+ 
+-use tokio::spawn;
+-use tokio_net::util::PollEvented;
+-use tokio_net::driver::Handle;
+-use tokio_timer::{Delay, delay};
++use tokio::time::{delay_until, Delay};
+ 
+ use crate::errors::{Error, ErrorKind};
+ use crate::packet::{IpV4Packet, IpV4Protocol};
+@@ -79,6 +76,7 @@ impl Future for PingFuture {
+         match self.inner {
+             PingFutureKind::Normal(ref mut normal) => {
+                 let mut swap_send = false;
++
+                 if let Some(ref mut send) = normal.send {
+                     match Pin::new(send).poll(cx) {
+                         Poll::Pending => (),
+@@ -87,6 +85,7 @@ impl Future for PingFuture {
+                     }
+                 }
+ 
++
+                 if swap_send {
+                     normal.send = None;
+                 }
+@@ -257,9 +256,9 @@ enum Sockets {
+ }
+ 
+ impl Sockets {
+-    fn new(handle: &Handle) -> io::Result<Self> {
+-        let mb_v4socket = Socket::new(Domain::ipv4(), Type::raw(), Protocol::icmpv4(), handle);
+-        let mb_v6socket = Socket::new(Domain::ipv6(), Type::raw(), Protocol::icmpv6(), handle);
++    fn new() -> io::Result<Self> {
++        let mb_v4socket = Socket::new(Domain::ipv4(), Type::raw(), Protocol::icmpv4());
++        let mb_v6socket = Socket::new(Domain::ipv6(), Type::raw(), Protocol::icmpv6());
+         match (mb_v4socket, mb_v6socket) {
+             (Ok(v4_socket), Ok(v6_socket)) => Ok(Sockets::Both {
+                 v4: v4_socket,
+@@ -291,13 +290,7 @@ impl Sockets {
+ impl Pinger {
+     /// Create new `Pinger` instance, will fail if unable to create both IPv4 and IPv6 sockets.
+     pub async fn new() -> Result<Self, Error> {
+-        futures::future::lazy(|_cx|
+-            Self::with_handle(&Handle::default()).map_err(From::from)
+-        ).await
+-    }
+-
+-    fn with_handle(handle: &Handle) -> io::Result<Self> {
+-        let sockets = Sockets::new(handle)?;
++        let sockets = Sockets::new()?;
+ 
+         let state = PingState::new();
+ 
+@@ -305,7 +298,7 @@ impl Pinger {
+             let (s, r) = oneshot::channel();
+             let receiver =
+                 Receiver::<IcmpV4>::new(v4_socket.clone(), state.clone());
+-            spawn(select(receiver, r).map(|_| ()));
++            tokio::spawn(select(receiver, r).map(|_| ()));
+             Some(s)
+         } else {
+             None
+@@ -315,7 +308,7 @@ impl Pinger {
+             let (s, r) = oneshot::channel();
+             let receiver =
+                 Receiver::<IcmpV6>::new(v6_socket.clone(), state.clone());
+-            spawn(select(receiver, r).map(|_| ()));
++            tokio::spawn(select(receiver, r).map(|_| ()));
+             Some(s)
+         } else {
+             None
+@@ -399,7 +392,7 @@ impl Pinger {
+                 start_time: Instant::now(),
+                 state: self.inner.state.clone(),
+                 token: token,
+-                delay: tokio_timer::delay(deadline),
++                delay: delay_until(deadline.into()),
+                 send: Some(send_future),
+                 receiver: receiver,
+             })
+diff --git a/src/socket/tokio.rs b/src/socket/tokio.rs
+index 2be14f4..7edc435 100644
+--- a/src/socket/tokio.rs
++++ b/src/socket/tokio.rs
+@@ -3,11 +3,10 @@ use std::sync::Arc;
+ use std::task::{Poll, Context};
+ use std::pin::Pin;
+ 
+-use futures::future::{Future, FutureExt, select};
++use std::future::Future;
+ use std::net::SocketAddr;
+ use ::mio::Ready;
+-use tokio_net::util::PollEvented;
+-use tokio_net::driver::Handle;
++use tokio::io::PollEvented;
+ use socket2::{Domain, Protocol, SockAddr, Type};
+ 
+ use super::mio;
+@@ -22,10 +21,9 @@ impl Socket {
+         domain: Domain,
+         type_: Type,
+         protocol: Protocol,
+-        handle: &Handle,
+     ) -> io::Result<Self> {
+         let socket = mio::Socket::new(domain, type_, protocol)?;
+-        let socket = PollEvented::new_with_handle(socket, handle)?;
++        let socket = PollEvented::new(socket)?;
+         Ok(Self {
+             socket: Arc::new(socket),
+         })
+-- 
+2.24.1.windows.2
+

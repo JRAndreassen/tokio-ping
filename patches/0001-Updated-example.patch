@@ -1,0 +1,54 @@
+From 5e555661e990e1196f98a1feedb0d4f5e9faa0c9 Mon Sep 17 00:00:00 2001
+From: Albin Hedman <albin9604@gmail.com>
+Date: Fri, 13 Dec 2019 00:54:50 +0100
+Subject: [PATCH] Updated example
+
+---
+ examples/simple.rs | 30 +++++++++++++-----------------
+ 1 file changed, 13 insertions(+), 17 deletions(-)
+
+diff --git a/examples/simple.rs b/examples/simple.rs
+index fbc767d..219be58 100644
+--- a/examples/simple.rs
++++ b/examples/simple.rs
+@@ -3,24 +3,20 @@ extern crate tokio;
+ 
+ extern crate tokio_ping;
+ 
+-use futures::{Future, Stream};
++use crate::futures::{StreamExt, future};
+ 
+-fn main() {
++#[tokio::main]
++async fn main() {
+     let addr = std::env::args().nth(1).unwrap().parse().unwrap();
+ 
+-    let pinger = tokio_ping::Pinger::new();
+-    let stream = pinger.and_then(move |pinger| Ok(pinger.chain(addr).stream()));
+-    let future = stream.and_then(|stream| {
+-        stream.take(3).for_each(|mb_time| {
+-            match mb_time {
+-                Some(time) => println!("time={:?}", time),
+-                None => println!("timeout"),
+-            }
+-            Ok(())
+-        })
+-    });
+-
+-    tokio::run(future.map_err(|err| {
+-        eprintln!("Error: {}", err)
+-    }))
++    let pinger = tokio_ping::Pinger::new().await.unwrap();
++    let stream = pinger.chain(addr).stream();
++    stream.take(3).for_each(|mb_time| {
++        match mb_time {
++            Ok(Some(time)) => println!("time={:?}", time),
++            Ok(None) => println!("timeout"),
++            Err(err) => println!("{:?}", err)
++        }
++        future::ready(())
++    }).await;
+ }
+-- 
+2.24.1.windows.2
+

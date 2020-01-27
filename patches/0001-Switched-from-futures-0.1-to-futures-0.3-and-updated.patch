@@ -1,0 +1,422 @@
+From b8d081067aabd02bd824cb987f9793098598b016 Mon Sep 17 00:00:00 2001
+From: Albin Hedman <albin9604@gmail.com>
+Date: Fri, 22 Nov 2019 18:22:53 +0100
+Subject: [PATCH] Switched from futures 0.1 to futures 0.3 and updated tokio
+
+---
+ Cargo.toml          |  11 +++--
+ src/errors.rs       |   2 +-
+ src/lib.rs          |   8 ----
+ src/ping.rs         | 105 +++++++++++++++++++++-----------------------
+ src/socket/tokio.rs |  66 +++++++++++++++++-----------
+ 5 files changed, 98 insertions(+), 94 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index bd3a358..dd6aa37 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -8,18 +8,17 @@ repository = "https://github.com/knsd/tokio-ping"
+ description = "Asynchronous ICMP pinging library"
+ keywords = ["tokio", "icmp", "ping"]
+ categories = ["network-programming", "asynchronous"]
++edition = "2018"
+ 
+ [dependencies]
+ failure = "0.1.1"
+-futures = "0.1"
++futures = "0.3.1"
+ libc = "0.2"
+ mio = "0.6"
+ rand = "0.4"
+ socket2 = "0.3"
++tokio = "0.2.0-alpha.6"
++tokio-net = "0.2.0-alpha.6"
+ tokio-executor="0.1.2"
+-tokio-reactor = "0.1.1"
+-tokio-timer = "0.2.3"
++tokio-timer = "0.3.0-alpha.5"
+ parking_lot = "0.5.5"
+-
+-[dev-dependencies]
+-tokio = "0.1"
+\ No newline at end of file
+diff --git a/src/errors.rs b/src/errors.rs
+index eb7e1f6..cca487f 100644
+--- a/src/errors.rs
++++ b/src/errors.rs
+@@ -8,7 +8,7 @@ pub struct Error {
+ }
+ 
+ impl Fail for Error {
+-    fn cause(&self) -> Option<&Fail> {
++    fn cause(&self) -> Option<&dyn Fail> {
+         self.inner.cause()
+     }
+ 
+diff --git a/src/lib.rs b/src/lib.rs
+index 6a45c72..4bbc818 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -37,14 +37,6 @@
+ 
+ #[macro_use] extern crate failure;
+ #[macro_use] extern crate futures;
+-extern crate libc;
+-extern crate mio;
+-extern crate rand;
+-extern crate socket2;
+-extern crate parking_lot;
+-extern crate tokio_executor;
+-extern crate tokio_reactor;
+-extern crate tokio_timer;
+ 
+ mod errors;
+ mod packet;
+diff --git a/src/ping.rs b/src/ping.rs
+index 99419db..88d419d 100644
+--- a/src/ping.rs
++++ b/src/ping.rs
+@@ -4,21 +4,25 @@ use std::collections::HashMap;
+ use std::net::{IpAddr, SocketAddr};
+ use std::sync::Arc;
+ use std::time::{Instant, Duration};
++use std::task::{Poll, Context};
++use std::pin::Pin;
+ 
+-use futures::{Async, Future, Poll, Stream};
+-use futures::sync::oneshot;
++use futures::future::{Future, FutureExt, select};
++use futures::stream::Stream;
++use futures::channel::oneshot;
+ use rand::random;
+ use parking_lot::Mutex;
+ use socket2::{Domain, Protocol, Type};
+ 
+-use tokio_executor::spawn;
+-use tokio_reactor::Handle;
+-use tokio_timer::Delay;
++use tokio::spawn;
++use tokio_net::util::PollEvented;
++use tokio_net::driver::Handle;
++use tokio_timer::{Delay, delay};
+ 
+-use errors::{Error, ErrorKind};
+-use packet::{IpV4Packet, IpV4Protocol};
+-use packet::{ICMP_HEADER_SIZE, IcmpV4, IcmpV6, EchoRequest, EchoReply};
+-use socket::{Socket, Send};
++use crate::errors::{Error, ErrorKind};
++use crate::packet::{IpV4Packet, IpV4Protocol};
++use crate::packet::{ICMP_HEADER_SIZE, IcmpV4, IcmpV6, EchoRequest, EchoReply};
++use crate::socket::{Socket, Send};
+ 
+ const DEFAULT_TIMEOUT: u64 = 2;
+ const TOKEN_SIZE: usize = 24;
+@@ -69,18 +73,17 @@ struct NormalPingFutureKind {
+ }
+ 
+ impl Future for PingFuture {
+-    type Item = Option<Duration>;
+-    type Error = Error;
++    type Output = Result<Option<Duration>, Error>;
+ 
+-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
++    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+         match self.inner {
+             PingFutureKind::Normal(ref mut normal) => {
+                 let mut swap_send = false;
+                 if let Some(ref mut send) = normal.send {
+-                    match send.poll() {
+-                        Ok(Async::NotReady) => (),
+-                        Ok(Async::Ready(_)) => swap_send = true,
+-                        Err(_) => return Err(ErrorKind::InternalError.into()),
++                    match Pin::new(send).poll(cx) {
++                        Poll::Pending => (),
++                        Poll::Ready(Ok(_)) => swap_send = true,
++                        Poll::Ready(Err(_)) => return Poll::Ready(Err(ErrorKind::InternalError.into())),
+                     }
+                 }
+ 
+@@ -88,28 +91,27 @@ impl Future for PingFuture {
+                     normal.send = None;
+                 }
+ 
+-                match normal.receiver.poll() {
+-                    Ok(Async::NotReady) => (),
+-                    Ok(Async::Ready(stop_time)) => {
+-                        return Ok(Async::Ready(Some(stop_time - normal.start_time)))
++                match Pin::new(&mut normal.receiver).poll(cx) {
++                    Poll::Pending => (),
++                    Poll::Ready(Ok(stop_time)) => {
++                        return Poll::Ready(Ok(Some(stop_time - normal.start_time)))
+                     },
+-                    Err(_) => return Err(ErrorKind::InternalError.into()),
++                    Poll::Ready(Err(_)) => return Poll::Ready(Err(ErrorKind::InternalError.into())),
+                 }
+ 
+-                match normal.delay.poll() {
+-                    Ok(Async::NotReady) => (),
+-                    Ok(Async::Ready(_)) => return Ok(Async::Ready(None)),
+-                    Err(_) => return Err(ErrorKind::InternalError.into()),
++                match Pin::new(&mut normal.delay).poll(cx) {
++                    Poll::Pending => (),
++                    Poll::Ready(_) => return Poll::Ready(Ok(None)),
+                 }
+             }
+             PingFutureKind::InvalidProtocol => {
+-                return Err(ErrorKind::InvalidProtocol.into())
++                return Poll::Ready(Err(ErrorKind::InvalidProtocol.into()))
+             }
+             PingFutureKind::PacketEncodeError => {
+-                return Err(ErrorKind::InternalError.into())
++                return Poll::Ready(Err(ErrorKind::InternalError.into()))
+             }
+         }
+-        Ok(Async::NotReady)
++        Poll::Pending
+     }
+ }
+ 
+@@ -220,19 +222,17 @@ impl PingChainStream {
+ }
+ 
+ impl Stream for PingChainStream {
+-    type Item = Option<Duration>;
+-    type Error = Error;
++    type Item = Result<Option<Duration>, Error>;
+ 
+-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
++    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+         let mut future = self.future.take().unwrap_or_else(|| self.chain.send());
+ 
+-        match future.poll() {
+-            Ok(Async::Ready(item)) => Ok(Async::Ready(Some(item))),
+-            Ok(Async::NotReady) => {
++        match Pin::new(&mut future).poll(cx) {
++            Poll::Ready(result) => Poll::Ready(Some(result)),
++            Poll::Pending => {
+                 self.future = Some(future);
+-                Ok(Async::NotReady)
++                Poll::Pending
+             },
+-            Err(err) => Err(err),
+         }
+     }
+ }
+@@ -290,11 +290,10 @@ impl Sockets {
+ 
+ impl Pinger {
+     /// Create new `Pinger` instance, will fail if unable to create both IPv4 and IPv6 sockets.
+-    pub fn new() -> impl Future<Item=Self, Error=Error> {
+-        ::futures::future::lazy(||
++    pub async fn new() -> Result<Self, Error> {
++        futures::future::lazy(|_cx|
+             Self::with_handle(&Handle::default()).map_err(From::from)
+-        )
+-
++        ).await
+     }
+ 
+     fn with_handle(handle: &Handle) -> io::Result<Self> {
+@@ -306,7 +305,7 @@ impl Pinger {
+             let (s, r) = oneshot::channel();
+             let receiver =
+                 Receiver::<IcmpV4>::new(v4_socket.clone(), state.clone());
+-            spawn(receiver.select(r.map_err(|_| ())).then(|_| Ok(())));
++            spawn(select(receiver, r).map(|_| ()));
+             Some(s)
+         } else {
+             None
+@@ -316,7 +315,7 @@ impl Pinger {
+             let (s, r) = oneshot::channel();
+             let receiver =
+                 Receiver::<IcmpV6>::new(v6_socket.clone(), state.clone());
+-            spawn(receiver.select(r.map_err(|_| ())).then(|_| Ok(())));
++            spawn(select(receiver, r).map(|_| ()));
+             Some(s)
+         } else {
+             None
+@@ -400,7 +399,7 @@ impl Pinger {
+                 start_time: Instant::now(),
+                 state: self.inner.state.clone(),
+                 token: token,
+-                delay: Delay::new(deadline),
++                delay: tokio_timer::delay(deadline),
+                 send: Some(send_future),
+                 receiver: receiver,
+             })
+@@ -411,7 +410,6 @@ impl Pinger {
+ struct Receiver<Message> {
+     socket: Socket,
+     state: PingState,
+-    buffer: [u8; 2048],
+     _phantom: ::std::marker::PhantomData<Message>,
+ }
+ 
+@@ -448,29 +446,28 @@ impl<Proto> Receiver<Proto> {
+         Self {
+             socket: socket,
+             state: state,
+-            buffer: [0; 2048],
+             _phantom: ::std::marker::PhantomData,
+         }
+     }
+ }
+ 
+ impl<Message: ParseReply> Future for Receiver<Message> {
+-    type Item = ();
+-    type Error = ();
++    type Output = Result<(), ()>;
+ 
+-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+-        match self.socket.recv(&mut self.buffer) {
+-            Ok(Async::Ready(bytes)) => {
+-                if let Some(payload) = Message::reply_payload(&self.buffer[..bytes]) {
++    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++        let mut buffer = [0; 2048];
++        match self.socket.recv(&mut buffer, cx) {
++            Poll::Ready(Ok(bytes)) => {
++                if let Some(payload) = Message::reply_payload(&buffer[..bytes]) {
+                     let now = Instant::now();
+                     if let Some(sender) = self.state.remove(payload) {
+                         sender.send(now).unwrap_or_default()
+                     }
+                 }
+-                self.poll()
++                self.poll(cx)
+             }
+-            Ok(Async::NotReady) => Ok(Async::NotReady),
+-            Err(_) => Err(()),
++            Poll::Pending => Poll::Pending,
++            Poll::Ready(Err(_)) => Poll::Ready(Err(())),
+         }
+     }
+ }
+diff --git a/src/socket/tokio.rs b/src/socket/tokio.rs
+index 2834bb5..2be14f4 100644
+--- a/src/socket/tokio.rs
++++ b/src/socket/tokio.rs
+@@ -1,13 +1,16 @@
+ use std::io;
+ use std::sync::Arc;
++use std::task::{Poll, Context};
++use std::pin::Pin;
+ 
+-use futures;
++use futures::future::{Future, FutureExt, select};
+ use std::net::SocketAddr;
+-use mio::Ready;
+-use tokio_reactor::{Handle, PollEvented};
++use ::mio::Ready;
++use tokio_net::util::PollEvented;
++use tokio_net::driver::Handle;
+ use socket2::{Domain, Protocol, SockAddr, Type};
+ 
+-use socket::mio;
++use super::mio;
+ 
+ #[derive(Clone)]
+ pub struct Socket {
+@@ -41,16 +44,21 @@ impl Socket {
+         }
+     }
+ 
+-    pub fn recv(&self, buffer: &mut [u8]) -> futures::Poll<usize, io::Error> {
+-        try_ready!(self.socket.poll_read_ready(Ready::readable()));
++    pub fn recv(&self, buffer: &mut [u8], cx: &mut Context<'_>) -> Poll<Result<usize, io::Error>> {
++
++        match self.socket.poll_read_ready(cx, Ready::readable()) {
++            Poll::Ready(Ok(_)) => (),
++            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
++            Poll::Pending => return Poll::Pending,
++        }
+ 
+         match self.socket.get_ref().recv(buffer) {
+-            Ok(n) => Ok(n.into()),
++            Ok(n) => Poll::Ready(Ok(n.into())),
+             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+-                self.socket.clear_read_ready(Ready::readable())?;
+-                Ok(futures::Async::NotReady)
++                self.socket.clear_read_ready(cx, Ready::readable())?;
++                Poll::Pending
+             }
+-            Err(e) => Err(e),
++            Err(e) => Poll::Ready(Err(e)),
+         }
+     }
+ }
+@@ -72,49 +80,57 @@ fn send_to(
+     socket: &Arc<PollEvented<mio::Socket>>,
+     buf: &[u8],
+     target: &SockAddr,
+-) -> futures::Poll<usize, io::Error> {
+-    try_ready!(socket.poll_write_ready());
++    cx: &mut Context<'_>
++) -> Poll<Result<usize, io::Error>> {
++    match socket.poll_write_ready(cx) {
++        Poll::Ready(Ok(_)) => (),
++        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
++        Poll::Pending => return Poll::Pending
++    }
+ 
+     match socket.get_ref().send_to(buf, target) {
+-        Ok(n) => Ok(n.into()),
++        Ok(n) => Poll::Ready(Ok(n.into())),
+         Err(e) => {
+             if e.kind() == io::ErrorKind::WouldBlock {
+-                socket.clear_write_ready()?;
+-                Ok(futures::Async::NotReady)
++                socket.clear_write_ready(cx)?;
++                Poll::Pending
+             } else {
+-                Err(e)
++                Poll::Ready(Err(e))
+             }
+         }
+     }
+ }
+ 
+-impl<T> futures::Future for Send<T>
++impl<T> Future for Send<T>
+ where
+-    T: AsRef<[u8]>,
++    T: AsRef<[u8]> + Unpin,
+ {
+-    type Item = ();
+-    type Error = io::Error;
++    type Output = Result<(), io::Error>;
+ 
+-    fn poll(&mut self) -> futures::Poll<(), io::Error> {
++    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+         match self.state {
+             SendState::Writing {
+                 ref socket,
+                 ref buf,
+                 ref addr,
+             } => {
+-                let n = try_ready!(send_to(socket, buf.as_ref(), addr));
++                let n = match send_to(socket, buf.as_ref(), addr, cx) {
++                    Poll::Ready(Ok(n)) => n,
++                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
++                    Poll::Pending => return Poll::Pending,
++                };
+                 if n != buf.as_ref().len() {
+-                    return Err(io::Error::new(
++                    return Poll::Ready(Err(io::Error::new(
+                         io::ErrorKind::Other,
+                         "failed to send entire packet",
+-                    ));
++                    )));
+                 }
+             }
+             SendState::Empty => panic!("poll a Send after it's done"),
+         }
+ 
+         match ::std::mem::replace(&mut self.state, SendState::Empty) {
+-            SendState::Writing { .. } => Ok(futures::Async::Ready(())),
++            SendState::Writing { .. } => Poll::Ready(Ok(())),
+             SendState::Empty => unreachable!(),
+         }
+     }
+-- 
+2.24.1.windows.2
+
